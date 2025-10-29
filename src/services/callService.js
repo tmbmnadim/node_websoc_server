@@ -9,10 +9,11 @@ class CallService {
     this.meetings = new Map();
   }
 
-  createMeeting({ hostUserId, participantIds = [], type = 'conference' }) {
+  createMeeting({name, hostUserId, participantIds = [], type = 'conference' }) {
     const meetingId = uuidv4();
     const meeting = {
       meetingId,
+      name,
       hostUserId,
       participantIds: Array.from(new Set([...(participantIds || []), hostUserId].filter(Boolean))),
       type,

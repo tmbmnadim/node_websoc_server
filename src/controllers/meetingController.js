@@ -1,9 +1,9 @@
 const callService = require('../services/callService');
 
 exports.create = (req, res) => {
-  const { hostUserId, participantIds, type } = req.body;
+  const {name, hostUserId, participantIds, type } = req.body;
   if (!hostUserId) return res.status(400).json({ message: 'hostUserId required' });
-  const meeting = callService.createMeeting({ hostUserId, participantIds, type });
+  const meeting = callService.createMeeting({ name, hostUserId, participantIds, type });
   return res.status(201).json(meeting);
 };
 
