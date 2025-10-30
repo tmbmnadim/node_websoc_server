@@ -37,10 +37,10 @@ app.get('/api', (req, res) => {
 const server = http.createServer(app);
 
 // Start WebSocket server separately
-setupWebSocketServer(); // Starts ws://localhost:8080/ws
+setupWebSocketServer(server); // Starts ws://localhost:8080/ws
 
 // Start HTTP API server
-server.listen(config.httpPort, () => {
-  logger.info(`HTTP API server running on http://localhost:${config.httpPort}`);
-  logger.info(`WebSocket server running on ws://localhost:${config.wsPort}/ws`);
+server.listen(config.httpPort, '10.10.10.29', () => {
+  logger.info(`HTTP API server running on http://0.0.0.0:${config.httpPort}`);
+  logger.info(`WebSocket server running on ws://0.0.0.0:${config.wsPort}/ws`);
 });

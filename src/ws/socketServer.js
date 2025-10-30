@@ -21,8 +21,9 @@ const directIce = {};
 /**
  * Initialize WebSocket server
  */
-function setupWebSocketServer() {
-  const wss = new WebSocketServer({ port: config.wsPort });
+function setupWebSocketServer(server) {
+  // Bind WS to existing HTTP server
+  const wss = new WebSocketServer({ server, path: '/ws' });
 
   wss.on('connection', (ws) => {
     const clientId = socketService.addSocket(ws);
@@ -44,8 +45,9 @@ function setupWebSocketServer() {
     });
   });
 
-  logger.info(`🚀 WebSocket server running on port ${config.wsPort}`);
+  logger.info(`🚀 WebSocket server attached to HTTP server at path /ws`);
 }
+
 
 /**
  * Handle all incoming WebSocket messages
