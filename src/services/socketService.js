@@ -1,67 +1,74 @@
-/**
- * socketService: keep track of connected WebSocket clients and mapping to users.
- * - sockets: Map(clientId -> ws)
- * - userToSocket: Map(userId -> clientId)
- * - socketMeta: Map(clientId -> { userId, meetingId })
- *
- * We use 'clientId' (uuid) for each ws connection.
- */
+// services/socketService.js
 const { v4: uuidv4 } = require('uuid');
 
-class SocketService {
-  constructor() {
-    this.sockets = new Map();
-    this.userToClient = new Map();
-    this.meta = new Map();
-  }
+/**
+ * Minimal in-memory socket service
+ * - addSocket(ws) -> clientId
+ * - removeSocket(clientId)
+ * - bindUser(clientId, userId)
+ * - bindMeeting(clientId, meetingId) (nullable)
+ * - getWsByClientId(clientId)
+ * - getClientIdByUser(userId)
+ * - getMeta(clientId) -> { userId, meetingId }
+ * - listClients() -> [clientId]
+ */
 
-  addSocket(ws) {
-    const clientId = uuidv4();
-    this.sockets.set(clientId, ws);
-    return clientId;
-  }
+const clients = new Map(); // clientId -> ws
+const metas = new Map(); // clientId -> { userId, meetingId }
+const userToClient = new Map(); // userId -> clientId
 
-  removeSocket(clientId) {
-    const ws = this.sockets.get(clientId);
-    if (ws) ws.terminate && ws.terminate();
-    this.sockets.delete(clientId);
-    const meta = this.meta.get(clientId);
-    if (meta && meta.userId) this.userToClient.delete(meta.userId);
-    this.meta.delete(clientId);
-  }
-
-  bindUser(clientId, userId) {
-    this.userToClient.set(userId, clientId);
-    const m = this.meta.get(clientId) || {};
-    m.userId = userId;
-    this.meta.set(clientId, m);
-  }
-
-  bindMeeting(clientId, meetingId) {
-    const m = this.meta.get(clientId) || {};
-    m.meetingId = meetingId;
-    this.meta.set(clientId, m);
-  }
-
-  setMeta(clientId, meta) {
-    this.meta.set(clientId, meta);
-  }
-
-  getWsByClientId(clientId) {
-    return this.sockets.get(clientId) || null;
-  }
-
-  getClientIdByUser(userId) {
-    return this.userToClient.get(userId) || null;
-  }
-
-  getMeta(clientId) {
-    return this.meta.get(clientId) || null;
-  }
-
-  listClients() {
-    return Array.from(this.sockets.keys());
-  }
+function addSocket(ws) {
+  const clientId = uuidv4();
+  clients.set(clientId, ws);
+  metas.set(clientId, { userId: null, meetingId: null });
+  return clientId;
 }
 
-module.exports = new SocketService();
+function removeSocket(clientId) {
+  const m = metas.get(clientId);
+  if (m && m.userId) {
+    userToClient.delete(m.userId);
+  }
+  metas.delete(clientId);
+  clients.delete(clientId);
+}
+
+function bindUser(clientId, userId) {
+  const meta = metas.get(clientId) || {};
+  meta.userId = userId;
+  metas.set(clientId, meta);
+  userToClient.set(userId, clientId);
+}
+
+function bindMeeting(clientId, meetingId) {
+  const meta = metas.get(clientId) || {};
+  meta.meetingId = meetingId;
+  metas.set(clientId, meta);
+}
+
+function getWsByClientId(clientId) {
+  return clients.get(clientId) || null;
+}
+
+function getClientIdByUser(userId) {
+  return userToClient.get(userId) || null;
+}
+
+function getMeta(clientId) {
+  return metas.get(clientId) || null;
+}
+
+function listClients() {
+  return Array.from(clients.keys());
+}
+
+module.exports = {
+  addSocket,
+  removeSocket,
+  bindUser,
+  bindMeeting,
+  getWsByClientId,
+  getClientIdByUser,
+  getMeta,
+  listClients,
+};
