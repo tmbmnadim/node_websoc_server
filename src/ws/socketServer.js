@@ -1,402 +1,352 @@
-// ws/socketServer.js
-const { WebSocketServer } = require('ws');
-const config = require('../config');
+// src/ws/socketServer.js
+const WebSocket = require('ws');
 const logger = require('../utils/logger');
 const socketService = require('../services/socketService');
 
+// meetingId -> { participants: Set<userId>, iceCandidates: { [userId]: [] }, sdps: { [userId]: {sdp,sdpType} } }
+const meetings = new Map();
+
 /**
- * In-memory meeting state:
- * meetings[meetingId] = {
- *   participants: Set<userId>,
- *   sdps: { userId: { sdp, sdpType } },   // optional cached sdps
- *   iceCandidates: { userId: [candidate, ...] }
- * }
- *
- * waitingAnswers[joinerKey] = {
- *   expected: Set<userId>,
- *   collected: { userId: answerObject },
- *   collectedCandidates: { userId: [candidate...] },
- *   joinerClientId,
- *   timer
- * }
+ * Setup WebSocket server attached to existing HTTP server
+ * @param {http.Server} server
+ * @param {string} wsPath (defaults to '/ws')
  */
+function setupWebSocketServer(server, wsPath = '/ws') {
+  const wss = new WebSocket.Server({ server, path: wsPath });
 
-const meetings = {};
-const waitingAnswers = {};
+  logger.info('🚀 WebSocket attached at path', wsPath);
 
-function tryParse(raw) {
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    return null;
-  }
-}
-
-function setupWebSocketServer(server) {
-  const wss = new WebSocketServer({ server, path: '/ws' });
-
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
     const clientId = socketService.addSocket(ws);
-    logger.info(`🟢 [CONNECT] client ${clientId}`);
+    logger.info(`[CONNECT] clientId=${clientId} remote=${req.socket.remoteAddress}`);
 
-    ws.on('message', (raw) => handleMessage(clientId, raw));
-    ws.on('close', () => handleClose(clientId));
-    ws.on('error', (err) => logger.error(`❌ [WS ERROR] client ${clientId}: ${err && err.message}`));
+    ws.on('message', (msg) => {
+      handleMessage(clientId, msg);
+    });
+
+    ws.on('close', () => {
+      const meta = socketService.getMeta(clientId);
+      logger.info(`[CLOSE] clientId=${clientId} meta=${JSON.stringify(meta)}`);
+      if (meta && meta.meetingId && meta.userId) {
+        removeUserFromMeeting(meta.userId, meta.meetingId);
+      }
+      socketService.removeSocket(clientId);
+    });
+
+    ws.on('error', (err) => {
+      logger.error(`[WS ERROR] clientId=${clientId}`, err);
+    });
   });
 
-  logger.info(`🚀 WebSocket attached at path ${config.wsPath}`);
+  return wss;
 }
 
-/* -------------------------
-   Message handling
-   ------------------------- */
-function handleMessage(clientId, raw) {
-  const parsed = tryParse(raw);
-  if (!parsed) {
-    logger.warn('[MSG] invalid json from', clientId);
-    sendToClient(clientId, { type: 'error', data: { message: 'invalid json' } });
-    return;
-  }
+/* ------------------- message handling ------------------- */
 
-  const type = parsed.type;
-  const data = parsed.data || {};
-  const meta = socketService.getMeta(clientId) || {};
-  const boundUser = meta.userId || data.from || null;
-  const boundMeeting = meta.meetingId || data.meeting_id || data.meetingId || null;
-
-  logger.info(`📩 [RECV] type:${type} from(client:${clientId},user:${boundUser}) meeting:${boundMeeting}`);
-  logger.debug('payload:', JSON.stringify(data));
-
+function handleMessage(clientId, rawMessage) {
   try {
+    // try parse
+    let msg = rawMessage;
+    if (typeof msg !== 'string') msg = msg.toString();
+    const parsed = JSON.parse(msg);
+
+    const { type, data } = parsed || {};
+    const meta = socketService.getMeta(clientId) || {};
+    const currentUserId = meta.userId;
+    const currentMeetingId = meta.meetingId;
+
+    logger.info(`📩 Received Message\nType: ${type}\nFrom(clientId): ${clientId}\nMeta: ${JSON.stringify(meta)}\nPayload: ${JSON.stringify(data)}`);
+
     switch (type) {
       case 'register':
         return handleRegister(clientId, data);
       case 'join_request':
-        return handleJoinRequest(clientId, boundUser, data);
+        return handleJoinRequest(clientId, data);
       case 'offer':
-        return handleOffer(clientId, boundUser, data);
+        return handleOffer(clientId, data);
       case 'answer':
-        return handleAnswer(clientId, boundUser, data);
+        return handleAnswer(clientId, data);
       case 'ice_candidate':
-        return handleIceCandidate(clientId, boundUser, data);
+        return handleIceCandidate(clientId, data);
       case 'leave':
-        return handleLeave(clientId, boundUser, boundMeeting);
+        return handleLeave(clientId, data);
       default:
-        logger.warn(`[MSG] unknown type ${type}`);
-        sendToClient(clientId, { type: 'error', data: { message: `unknown type: ${type}` } });
+        logger.warn(`[UNKNOWN] type=${type}`);
+        sendToClient(clientId, { type: 'error', data: { message: `Unknown message type: ${type}` } });
     }
   } catch (err) {
-    logger.error('[HANDLE ERROR]', err && err.stack ? err.stack : err);
-    sendToClient(clientId, { type: 'error', data: { message: err.message || String(err) } });
+    logger.error('[HANDLE ERROR]', err);
+    sendToClient(clientId, { type: 'error', data: { message: err.message } });
   }
 }
 
-/* -------------------------
-   Handlers
-   ------------------------- */
-
-function handleRegister(clientId, data) {
-  if (!data || !data.from) throw new Error('register requires from (userId)');
-  const userId = data.from;
-  socketService.bindUser(clientId, userId);
-  logger.info(`[REGISTER] client ${clientId} -> user ${userId}`);
-  sendToClient(clientId, { type: 'registered', data: { from: userId } });
-}
-
-/**
- * join_request -> respond with participants: [userId...]
- */
-function handleJoinRequest(clientId, fromUser, data) {
-  if (!fromUser) throw new Error('Must register before join_request');
-  const meetingId = data.meeting_id;
-  if (!meetingId) throw new Error('join_request requires meeting_id');
-
-  if (!meetings[meetingId]) {
-    meetings[meetingId] = { participants: new Set(), sdps: {}, iceCandidates: {} };
-  }
-
-  const participants = Array.from(meetings[meetingId].participants || []);
-  logger.info(`[JOIN_REQUEST] ${fromUser} asked participants for ${meetingId}: ${participants.length} participants`);
-  sendToClient(clientId, { type: 'participants', data: { meeting_id: meetingId, participants } });
-}
-
-/**
- * offer: { from, meeting_id?, offers: [{from,to,sdp_details}, ...] }
- * - forward each offer as type 'offer' with single-item offers array to the target user
- * - if meeting flow (meeting_id present) set up waitingAnswers aggregator for joiner
- */
-function handleOffer(clientId, fromUser, data) {
-  if (!fromUser) throw new Error('Must register to send offers');
-  const meetingId = data.meeting_id || null;
-  const offers = data.offers;
-  if (!offers || !Array.isArray(offers) || offers.length === 0) throw new Error('offers array required');
-
-  // collect distinct targets
-  const targets = new Set();
-  for (const o of offers) {
-    if (o && o.to) targets.add(o.to);
-  }
-
-  let joinerKey = null;
-  if (meetingId) {
-    joinerKey = `${meetingId}:${fromUser}`;
-    waitingAnswers[joinerKey] = {
-      expected: new Set(Array.from(targets)),
-      collected: {},
-      collectedCandidates: {},
-      joinerClientId: clientId,
-      timer: null,
-    };
-    // small aggregation window for answers
-    waitingAnswers[joinerKey].timer = setTimeout(() => flushWaitingAnswers(joinerKey), 3000);
-  }
-
-  // Forward each single offer to its target as 'offer'
-  for (const o of offers) {
-    const target = o.to;
-    const payload = {
-      type: 'offer',
-      data: {
-        offers: [ { from: o.from, to: o.to, sdp_details: o.sdp_details } ],
-        meeting_id: meetingId,
-      },
-    };
-
-    const targetClientId = socketService.getClientIdByUser(target);
-    if (targetClientId) {
-      sendToClient(targetClientId, payload);
-      logger.info(`[FORWARD OFFER] ${o.from} -> ${target} (client ${targetClientId})`);
-    } else {
-      logger.warn(`[FORWARD OFFER] target ${target} not online`);
-      // Optionally notify joiner: sendToClient(clientId, {type:'denied', data:{message:`target ${target} offline`}});
-      // Also, remove expected target so waitingAnswers won't wait forever
-      if (joinerKey && waitingAnswers[joinerKey]) {
-        waitingAnswers[joinerKey].expected.delete(target);
-      }
-    }
-
-    // Add target user to meeting participants if meeting flow (they are already participants in existing meeting typically)
-    if (meetingId) {
-      if (!meetings[meetingId]) meetings[meetingId] = { participants: new Set(), sdps: {}, iceCandidates: {} };
-      meetings[meetingId].participants.add(o.to);
-    }
-  }
-
-  // ack to sender
-  sendToClient(clientId, { type: 'offer', data: { from: fromUser, status: 'sent' } });
-}
-
-/**
- * answer: { from, meeting_id?, answers: [{from,to,sdp_details}], candidates: [{user_id, candidates: [...]}, ...] }
- *
- * Behavior:
- * - For each answer entry: if there is a waitingAnswers entry for key `${meetingId}:${to}` (joiner flow),
- *   collect the answer and candidates.
- * - If waiting entry doesn't exist -> forward immediately to the `to` user as type 'answer'
- */
-function handleAnswer(clientId, fromUser, data) {
-  if (!fromUser) throw new Error('Must register to send answers');
-  const answers = data.answers;
-  const candidateGroups = data.candidates || []; // array of { user_id, candidates }
-  const meetingId = data.meeting_id || null;
-
-  if (!answers || !Array.isArray(answers) || answers.length === 0) throw new Error('answers array required');
-
-  // build a helper map from candidateGroups for easy lookups
-  const candidatesMap = {};
-  if (Array.isArray(candidateGroups)) {
-    for (const g of candidateGroups) {
-      if (g && g.user_id) {
-        candidatesMap[g.user_id] = g.candidates || [];
-      }
-    }
-  }
-
-  for (const ans of answers) {
-    const toUser = ans.to;
-    const joinerKey = meetingId ? `${meetingId}:${toUser}` : null;
-
-    if (joinerKey && waitingAnswers[joinerKey]) {
-      // collect answer for aggregator
-      waitingAnswers[joinerKey].collected[fromUser] = ans;
-      waitingAnswers[joinerKey].collectedCandidates[fromUser] = candidatesMap[fromUser] || [];
-      logger.info(`[COLLECT ANSWER] from ${fromUser} for joiner ${toUser} (meeting ${meetingId})`);
-
-      const expected = waitingAnswers[joinerKey].expected;
-      const collectedKeys = Object.keys(waitingAnswers[joinerKey].collected);
-      const haveAll = Array.from(expected).every((u) => collectedKeys.includes(u));
-      if (haveAll) {
-        flushWaitingAnswers(joinerKey);
-      }
-    } else {
-      // no aggregator -> forward immediately
-      const targetClientId = socketService.getClientIdByUser(toUser);
-      if (targetClientId) {
-        const payload = {
-          type: 'answer',
-          data: {
-            answers: [ ans ],
-            candidates: candidateGroups // forward candidateGroups as-is
-          }
-        };
-        sendToClient(targetClientId, payload);
-        logger.info(`[FORWARD ANSWER] ${fromUser} -> ${toUser}`);
-      } else {
-        logger.warn(`[FORWARD ANSWER] target ${toUser} not online`);
-      }
-    }
-  }
-
-  // ack
-  sendToClient(clientId, { type: 'answer', data: { from: fromUser, status: 'received' } });
-}
-
-/**
- * flushWaitingAnswers(joinerKey)
- * -> build aggregated answers array and combined candidates array of {user_id, candidates}
- * -> send one 'answer' message to joiner
- */
-function flushWaitingAnswers(joinerKey) {
-  const entry = waitingAnswers[joinerKey];
-  if (!entry) return;
-  if (entry.timer) {
-    clearTimeout(entry.timer);
-    entry.timer = null;
-  }
-
-  const collectedAnswers = [];
-  const combinedCandidates = [];
-
-  for (const userId of Object.keys(entry.collected)) {
-    const ans = entry.collected[userId];
-    collectedAnswers.push(ans);
-
-    const cands = entry.collectedCandidates[userId] || [];
-    if (Array.isArray(cands) && cands.length > 0) {
-      combinedCandidates.push({ user_id: userId, candidates: cands });
-    }
-  }
-
-  const joinerClientId = entry.joinerClientId;
-  if (joinerClientId) {
-    const payload = {
-      type: 'answer',
-      data: {
-        answers: collectedAnswers,
-        candidates: combinedCandidates
-      }
-    };
-    sendToClient(joinerClientId, payload);
-    logger.info(`[FLUSH ANSWERS] Sent ${collectedAnswers.length} answers to joiner (client ${joinerClientId})`);
-  } else {
-    logger.warn(`[FLUSH ANSWERS] joiner client not found for ${joinerKey}`);
-  }
-
-  delete waitingAnswers[joinerKey];
-}
-
-/**
- * ice_candidate handler (incremental)
- * - If data.to provided -> forward to that user
- * - Else if data.meeting_id provided -> add to meeting map and broadcast aggregated ice info
- * Note: your primary candidate flow is in answers.candidates; this incremental handler is optional.
- */
-function handleIceCandidate(clientId, fromUser, data) {
-  if (!fromUser) throw new Error('must register first');
-  if (!data.candidate) throw new Error('candidate missing');
-
-  const toUser = data.to || null;
-  const meetingId = data.meeting_id || data.meetingId || null;
-
-  if (toUser) {
-    const targetClientId = socketService.getClientIdByUser(toUser);
-    if (!targetClientId) {
-      sendToClient(clientId, { type: 'error', data: { message: `target ${toUser} offline` } });
-      return;
-    }
-    sendToClient(targetClientId, { type: 'ice_candidate', data: { from: fromUser, to: toUser, candidate: data.candidate } });
-    logger.info(`[ICE FORWARD] ${fromUser} -> ${toUser}`);
-    return;
-  }
-
-  if (meetingId) {
-    if (!meetings[meetingId]) meetings[meetingId] = { participants: new Set(), sdps: {}, iceCandidates: {} };
-    const map = meetings[meetingId].iceCandidates;
-    if (!map[fromUser]) map[fromUser] = [];
-    map[fromUser].push(data.candidate);
-
-    const payload = { type: 'ice_candidate', data: { meeting_id: meetingId, ice_map: meetings[meetingId].iceCandidates } };
-    broadcastToMeeting(meetingId, null, payload);
-    logger.info(`[ICE BROADCAST] from ${fromUser} in meeting ${meetingId}`);
-    return;
-  }
-
-  throw new Error('either to or meeting_id required for ice_candidate');
-}
-
-/**
- * handleLeave
- */
-function handleLeave(clientId, fromUser, meetingId) {
-  if (!fromUser) throw new Error('not in meeting');
-  if (!meetingId) throw new Error('meetingId required');
-  removeUserFromMeeting(fromUser, meetingId);
-  socketService.bindMeeting(clientId, null);
-  sendToClient(clientId, { type: 'leave', data: { from: fromUser } });
-}
-
-/* -------------------------
-   Helpers
-   ------------------------- */
-
-function handleClose(clientId) {
-  const meta = socketService.getMeta(clientId) || {};
-  logger.info(`[CLOSE] client ${clientId} disconnected meta: ${JSON.stringify(meta)}`);
-  if (meta && meta.userId && meta.meetingId) {
-    removeUserFromMeeting(meta.userId, meta.meetingId);
-  }
-  socketService.removeSocket(clientId);
-}
-
-function removeUserFromMeeting(userId, meetingId) {
-  const meeting = meetings[meetingId];
-  if (!meeting) return;
-  meeting.participants.delete(userId);
-  delete meeting.sdps[userId];
-  delete meeting.iceCandidates[userId];
-
-  broadcastToMeeting(meetingId, null, { type: 'participant_left', data: { from: userId } });
-
-  const payload = { type: 'ice_candidate', data: { meeting_id: meetingId, ice_map: meeting.iceCandidates } };
-  broadcastToMeeting(meetingId, null, payload);
-
-  logger.info(`[REMOVE] ${userId} removed from meeting ${meetingId}`);
-}
+/* ------------------- helpers & handlers ------------------- */
 
 function sendToClient(clientId, payload) {
   const ws = socketService.getWsByClientId(clientId);
   if (!ws) {
-    logger.warn(`[SEND FAIL] client ${clientId} socket not found`);
+    logger.warn(`[SEND FAIL] client not found ${clientId}`);
     return;
   }
   try {
-    ws.send(JSON.stringify(payload));
-    logger.info(`[SEND] client ${clientId} <- ${payload.type}`);
-  } catch (e) {
-    logger.error('[SEND ERROR]', e && e.message ? e.message : e);
+    const s = JSON.stringify(payload);
+    ws.send(s);
+    const meta = socketService.getMeta(clientId) || {};
+    logger.info(`Sending Message\nto clientId:${clientId}\nuser:${meta.userId || 'unknown'}\nPayload:${s}`);
+  } catch (err) {
+    logger.error('[SEND ERROR]', err);
   }
 }
 
-function broadcastToMeeting(meetingId, excludeClientId, message) {
-  const all = socketService.listClients();
-  all.forEach((clientId) => {
-    if (clientId === excludeClientId) return;
+function broadcastToMeeting(meetingId, excludeClientId, payload) {
+  for (const clientId of socketService.listClients()) {
+    if (clientId === excludeClientId) continue;
     const meta = socketService.getMeta(clientId);
     if (meta && meta.meetingId === meetingId) {
-      sendToClient(clientId, message);
+      sendToClient(clientId, payload);
+    }
+  }
+  logger.info(`📣 [BROADCAST] meeting=${meetingId} type=${payload.type}`);
+}
+
+/* ------------------- register ------------------- */
+/**
+ * data: { from: "userId", name: "Nadim" }
+ * - 'from' must be the user id created earlier via /api/users (but we don't enforce strictly)
+ */
+function handleRegister(clientId, data) {
+  if (!data || !data.from) {
+    throw new Error('register requires from (userId)');
+  }
+  const userId = data.from;
+  const name = data.name || 'unknown';
+
+  // bind socket <-> user
+  socketService.bindUser(clientId, userId);
+
+  // respond
+  sendToClient(clientId, {
+    type: 'registered',
+    data: { id: userId, name, is_online: true, created_at: new Date().toISOString() },
+  });
+  logger.info(`[REGISTER] clientId=${clientId} user=${userId} name=${name}`);
+}
+
+/* ------------------- join_request ------------------- */
+/**
+ * data: { from: "userId", meeting_id: "m-..." }
+ * Response to requester: { type: 'participants', data: { participants: [userId,...] } }
+ * Server also NOTIFIES existing participants via 'participant_joined' broadcast
+ */
+function handleJoinRequest(clientId, data) {
+  if (!data || !data.from || !data.meeting_id) {
+    throw new Error('join_request requires from and meeting_id');
+  }
+  const userId = data.from;
+  const meetingId = data.meeting_id;
+
+  // bind meeting
+  socketService.bindMeeting(clientId, meetingId);
+
+  if (!meetings.has(meetingId)) {
+    meetings.set(meetingId, {
+      participants: new Set(),
+      iceCandidates: {},
+      sdps: {},
+    });
+  }
+  const meeting = meetings.get(meetingId);
+  const prev = Array.from(meeting.participants);
+  meeting.participants.add(userId);
+
+  // reply with participant list
+  sendToClient(clientId, { type: 'participants', data: { participants: prev } });
+
+  // notify others that a participant joined (they can expect offers from new participant soon)
+  broadcastToMeeting(meetingId, clientId, { type: 'participant_joined', data: { userId, meetingId } });
+
+  // also send meeting state (ice + sdps) to the new user
+  sendToClient(clientId, {
+    type: 'meeting_state',
+    data: {
+      meetingId,
+      participants: Array.from(meeting.participants),
+      iceMap: meeting.iceCandidates,
+      sdpMap: meeting.sdps,
+    },
+  });
+
+  logger.info(`[JOIN] user=${userId} meeting=${meetingId}`);
+}
+
+/* ------------------- offer ------------------- */
+/**
+ * data either:
+ *  - { offers: [ {from,to,sdp_details}, ... ] } // meeting or list-based
+ *  - { offers: [ ... ], to: "targetUserId" } // optional to override and send direct
+ *
+ * If 'to' provided at top-level -> forward offers directly to that user (1:1).
+ * Otherwise for each offer, send offer to the 'to' target.
+ */
+function handleOffer(clientId, data) {
+  if (!data || !data.offers || !Array.isArray(data.offers)) {
+    throw new Error('offer requires offers array');
+  }
+
+  const topLevelTo = data.to; // optional shorthand target
+  if (topLevelTo) {
+    const targetClient = socketService.getClientIdByUser(topLevelTo);
+    if (!targetClient) {
+      sendToClient(clientId, { type: 'error', data: { message: 'Target not online' } });
+      return;
+    }
+    sendToClient(targetClient, { type: 'offer', data: { offers: data.offers } });
+    return;
+  }
+
+  // per-offer routing
+  data.offers.forEach((offer) => {
+    const to = offer.to;
+    if (!to) return;
+    const targetClient = socketService.getClientIdByUser(to);
+    if (targetClient) {
+      sendToClient(targetClient, { type: 'offer', data: { offers: [offer] } });
+      logger.info(`[OFFER] forwarded from ${offer.from} -> ${to}`);
+    } else {
+      logger.warn(`[OFFER] target ${to} not online`);
+    }
+
+    // Also store SDP in meeting sdps if meeting_id provided on offer (optional)
+    if (offer.meeting_id) {
+      const m = meetings.get(offer.meeting_id);
+      if (m) {
+        m.sdps[offer.from] = offer.sdp_details;
+      }
     }
   });
-  logger.info(`[BROADCAST] meeting ${meetingId} -> ${message.type}`);
+}
+
+/* ------------------- answer ------------------- */
+/**
+ * data:
+ *  - { answers: [ {from,to,sdp_details, meeting_id?}, ... ] }  // meeting or list
+ *  - or top-level `to` to direct
+ *
+ * Server forwards answers to target(s) and stores in meeting map if meeting_id present.
+ */
+function handleAnswer(clientId, data) {
+  if (!data || !data.answers || !Array.isArray(data.answers)) {
+    throw new Error('answer requires answers array');
+  }
+
+  const topLevelTo = data.to;
+  if (topLevelTo) {
+    const targetClient = socketService.getClientIdByUser(topLevelTo);
+    if (!targetClient) {
+      sendToClient(clientId, { type: 'error', data: { message: 'Target not online' } });
+      return;
+    }
+    sendToClient(targetClient, { type: 'answer', data: { answers: data.answers } });
+    return;
+  }
+
+  data.answers.forEach((ans) => {
+    const to = ans.to;
+    if (!to) return;
+    const targetClient = socketService.getClientIdByUser(to);
+    if (targetClient) {
+      sendToClient(targetClient, { type: 'answer', data: { answers: [ans] } });
+      logger.info(`[ANSWER] forwarded from ${ans.from} -> ${to}`);
+    } else {
+      logger.warn(`[ANSWER] target ${to} not online`);
+    }
+
+    // store in meeting map if provided
+    if (ans.meeting_id) {
+      const m = meetings.get(ans.meeting_id);
+      if (m) m.sdps[ans.from] = ans.sdp_details;
+    }
+  });
+}
+
+/* ------------------- ice_candidate ------------------- */
+/**
+ * data:
+ *  - { from: userId, candidates: [ { user_id: targetId, candidates: [ {candidate,sdpMid,sdpMLineIndex}, ... ] }, ... ], to?: targetId }
+ *
+ * If data.to exists -> forward to that user (direct)
+ * Otherwise -> treat as meeting candidates and store + broadcast
+ */
+function handleIceCandidate(clientId, data) {
+  if (!data || !data.from || !data.candidates || !Array.isArray(data.candidates)) {
+    throw new Error('ice_candidate requires from and candidates array');
+  }
+
+  const topLevelTo = data.to;
+  if (topLevelTo) {
+    const targetClient = socketService.getClientIdByUser(topLevelTo);
+    if (!targetClient) {
+      sendToClient(clientId, { type: 'error', data: { message: 'Target not online' } });
+      return;
+    }
+    // forward candidate payload directly
+    sendToClient(targetClient, { type: 'ice_candidate', data: { from: data.from, candidates: data.candidates } });
+    logger.info(`[ICE] Direct forwarded from ${data.from} -> ${topLevelTo}`);
+    return;
+  }
+
+  // meeting-based: for each { user_id, candidates: [...] } entry
+  data.candidates.forEach((entry) => {
+    const targetUserId = entry.user_id;
+    // store candidate in meeting that contains both (if any)
+    // find meeting(s) where from and targetUserId are both present (simple linear check)
+    for (const [meetingId, meeting] of meetings.entries()) {
+      if (meeting.participants.has(data.from)) {
+        // ensure array exists
+        if (!meeting.iceCandidates[data.from]) meeting.iceCandidates[data.from] = [];
+        meeting.iceCandidates[data.from].push(...entry.candidates);
+      }
+    }
+
+    // forward candidates to the target user if online
+    const targetClient = socketService.getClientIdByUser(targetUserId);
+    if (targetClient) {
+      sendToClient(targetClient, { type: 'ice_candidate', data: { from: data.from, candidates: [entry] } });
+      logger.info(`[ICE] forwarded ${data.from} -> ${targetUserId}`);
+    }
+  });
+
+  // option: broadcast full ice map to meeting participants (if you want)
+}
+
+/* ------------------- leave ------------------- */
+function handleLeave(clientId, data) {
+  if (!data || !data.from) {
+    throw new Error('leave requires from');
+  }
+  const userId = data.from;
+  const meetingId = data.meeting_id || socketService.getMeta(clientId).meetingId;
+
+  if (meetingId && meetings.has(meetingId)) {
+    removeUserFromMeeting(userId, meetingId);
+  }
+
+  // optionally remove socket->user mapping if this user logs out
+  // socketService.removeSocket(clientId) -> handled on close
+  logger.info(`[LEAVE] user=${userId} meeting=${meetingId || 'none'}`);
+}
+
+/* ------------------- meeting helpers ------------------- */
+function removeUserFromMeeting(userId, meetingId) {
+  const meeting = meetings.get(meetingId);
+  if (!meeting) return;
+  meeting.participants.delete(userId);
+  delete meeting.iceCandidates[userId];
+  delete meeting.sdps[userId];
+
+  // broadcast participant_left
+  broadcastToMeeting(meetingId, null, { type: 'participant_left', data: { from: userId } });
+  logger.info(`[REMOVE] user=${userId} removed from meeting=${meetingId}`);
 }
 
 module.exports = setupWebSocketServer;

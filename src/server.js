@@ -1,4 +1,4 @@
-// server.js
+// src/server.js
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
@@ -23,14 +23,14 @@ app.get('/', (req, res) => {
 
 app.use('/api/users', userRoutes);
 app.use('/api/meetings', meetingRoutes);
+
 app.get('/api', (req, res) => res.json({ message: 'WebSocket signaling API up' }));
 
 const server = http.createServer(app);
 
 // attach websocket server to same HTTP server at config.wsPath
-setupWebSocketServer(server);
+setupWebSocketServer(server, config.wsPath);
 
-// listen on all interfaces
 server.listen(config.httpPort, '0.0.0.0', () => {
   logger.info(`HTTP server listening on http://0.0.0.0:${config.httpPort}`);
   logger.info(`WebSocket path: ws://0.0.0.0:${config.httpPort}${config.wsPath}`);

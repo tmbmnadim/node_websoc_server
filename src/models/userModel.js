@@ -1,36 +1,22 @@
-/**
- * Minimal in-memory user model.
- * For production swap with a DB (Mongo/Postgres).
- */
+// src/models/userModel.js
 const { v4: uuidv4 } = require('uuid');
 
-class UserModel {
-  constructor() {
-    this.users = new Map(); // id -> user
+class LiveUser {
+  constructor({ id = null, name, isOnline = false, createdAt = null }) {
+    this.id = id || uuidv4();
+    this.name = name;
+    this.is_online = isOnline;
+    this.created_at = createdAt ? (new Date(createdAt)).toISOString() : new Date().toISOString();
   }
 
-  create(name) {
-    const id = uuidv4();
-    const user = { id, name, createdAt: new Date().toISOString() };
-    this.users.set(id, user);
-    return user;
-  }
-
-  list() {
-    return Array.from(this.users.values());
-  }
-
-  get(id) {
-    return this.users.get(id) || null;
-  }
-
-  delete(id) {
-    return this.users.delete(id);
-  }
-
-  clear() {
-    this.users.clear();
+  toJSON() {
+    return {
+      id: this.id,
+      name: this.name,
+      is_online: this.is_online,
+      created_at: this.created_at,
+    };
   }
 }
 
-module.exports = new UserModel();
+module.exports = { LiveUser };

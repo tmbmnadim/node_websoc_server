@@ -1,26 +1,33 @@
-// routes/meetingRoutes.js
+// src/routes/meetingRoutes.js
 const express = require('express');
-const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
+const { meetings } = require('../data/store');
 
-const meetings = new Map(); // id -> { id, name, created_at }
+const router = express.Router();
 
+/**
+ * Create meeting
+ * POST /api/meetings
+ * body: { title: "Meeting", host_id: "userId" }  (host_id optional)
+ */
 router.post('/', (req, res) => {
-  const name = req.body.name || `meeting-${Math.floor(Math.random() * 1000)}`;
-  const id = uuidv4();
-  const meeting = { id, name, created_at: new Date().toISOString() };
+  const { title = 'Meeting', host_id = null } = req.body;
+  const id = `m-${uuidv4()}`;
+  const meeting = {
+    id,
+    title,
+    host_id,
+    created_at: new Date().toISOString(),
+  };
   meetings.set(id, meeting);
-  res.json(meeting);
+  res.status(201).json(meeting);
 });
 
+/**
+ * GET /api/meetings
+ */
 router.get('/', (req, res) => {
-  res.json(Array.from(meetings.values()));
-});
-
-router.get('/:id', (req, res) => {
-  const meeting = meetings.get(req.params.id);
-  if (!meeting) return res.status(404).json({ message: 'not found' });
-  res.json(meeting);
+  return res.json(Array.from(meetings.values()));
 });
 
 module.exports = router;

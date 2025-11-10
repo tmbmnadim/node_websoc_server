@@ -1,10 +1,10 @@
-/**
- * Basic configuration loader
- */
+// src/config/index.js
 require('dotenv').config();
-module.exports = {
-  httpPort: process.env.HTTP_PORT || 3000,
-  wsPort: process.env.WS_PORT || 3000,
-  wsPath: process.env.WS_PATH || '/ws',
-};
 
+const HTTP_PORT = process.env.HTTP_PORT || 3000;
+const WS_PATH = process.env.WS_PATH || '/ws';
+
+module.exports = {
+  httpPort: Number(HTTP_PORT),
+  wsPath: WS_PATH,
+};

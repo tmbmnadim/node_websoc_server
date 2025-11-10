@@ -1,7 +1,8 @@
 {
   "name": "webrtc-signaling-server",
   "version": "1.0.0",
-  "main": "server.js",
+  "description": "WebRTC signaling server (HTTP + WebSocket) for testing",
+  "main": "src/server.js",
   "scripts": {
     "start": "node ./src/server.js"
   },
@@ -10,6 +11,6 @@
     "dotenv": "^17.2.3",
     "express": "^4.18.2",
     "uuid": "^9.0.0",
-    "ws": "^8.12.0"
+    "ws": "^8.13.0"
   }
 }
